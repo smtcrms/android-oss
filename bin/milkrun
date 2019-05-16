@@ -1,0 +1,123 @@
+#!/usr/bin/env ruby
+
+$:.unshift File.expand_path(File.join(File.dirname(__FILE__), '..', 'lib'))
+require 'milkrun'
+require_relative '../config/initializer'
+require 'commander'
+require 'fileutils'
+
+class MilkrunApplication
+  include Commander::Methods
+
+  def run
+    program :name, 'Milkrun'
+    program :version, '0.0.1'
+    program :description, 'Command-line tool for deploying the Kickstarter Android app'
+
+    command :builds do |c|
+      c.syntax = "milkrun builds"
+      c.description = "Show list of published builds"
+      c.action do |args, options|
+        puts Milkrun::BuildList.new.fetch.to_yaml
+      end
+    end
+
+    command :"create-string-resources" do |c|
+      c.syntax = "milkrun create-string-resources"
+      c.description = "create string resources from local config file"
+      c.action do |args, options|
+        Milkrun::I18nStringResources.new.create
+      end
+    end
+
+    command :external do |c|
+      c.syntax = 'milkrun external'
+      c.description = 'Prepare a .apk and update HockeyApp in preparation for submitting to the Play Store'
+      c.action do |args, options|
+        audience = 'external'
+        build_type = 'release'
+
+        Milkrun::Git.new.check
+
+        Milkrun::ServerConfigRefresher.new.refresh
+        Milkrun::I18nStringResources.new.create
+
+        version_code = Milkrun::VersionCode.new(audience: audience).bump
+        version_name = Milkrun::VersionName.new(audience: audience).prompt
+        Milkrun.prompt <<-CHECKLIST
+Release checklist!
+
+1) Make sure the build passes in CircleCI.
+2) Build and run locally in externalRelease mode, test core features on a real device.
+CHECKLIST
+        output_path = Milkrun::Build.new(audience: audience, build_type: build_type).compile
+        pretty_path = File.join(File.dirname(output_path), "kickstarter-#{version_name}.apk")
+        FileUtils.cp(output_path, pretty_path)
+        Milkrun::HockeyApp.new(audience: audience, version_code: version_code, version_name: version_name).create_version
+        Milkrun.say "HockeyApp updated, now upload the .apk at #{pretty_path} to the Google Play Console 👌"
+      end
+    end
+
+    command :internal do |c|
+      c.syntax = 'milkrun internal'
+      c.description = "Submit a new internal build to S3"
+      c.action do |args, options|
+        audience = 'internal'
+        build_type = 'release'
+
+        Milkrun::Git.new.check
+
+        Milkrun::ServerConfigRefresher.new.refresh
+        Milkrun::I18nStringResources.new.create
+
+        version_code = Milkrun::VersionCode.new(audience: audience).bump
+        version_name = Milkrun::VersionName.new(audience: audience).prompt
+        Milkrun.prompt <<-CHECKLIST
+Release checklist!
+
+1) Make sure the build passes in CircleCI.
+2) Build and run locally in internalRelease mode, test core features on a real device.
+CHECKLIST
+        file_path = Milkrun::Build.new(audience: audience, build_type: build_type).compile
+        Milkrun::HockeyApp.new(audience: audience, version_code: version_code, version_name: version_name).create_version
+        Milkrun::S3Package.new(version_code: version_code, file_path: file_path).upload
+        Milkrun::Changelog.new(audience: audience, build_type: build_type, version_code: version_code).publish
+        Milkrun.say "All done, now commit your local version changes! 👌"
+      end
+    end
+
+    command :quality do |c|
+      c.syntax = "milkrun quality"
+      c.description = "run checkstyle, lint"
+      c.action do
+        checkstyle = Milkrun::Checkstyle.new
+        checkstyle.run
+        lint = Milkrun::Lint.new
+        lint.run
+
+        { "Lint" => lint, "Checkstyle" => checkstyle }.each do |name, report|
+          if report.result
+            Milkrun.say "#{name} successful 👌"
+          else
+            Milkrun.error "#{name} failed, see #{report.report_path} for report 🍤"
+            system("open #{report.report_path}")
+          end
+        end
+      end
+    end
+
+    command :"update-strings" do |c|
+      c.syntax = "milkrun update-strings"
+      c.description = "refresh config and create string resources"
+      c.option "--local", "Use local development server instead of production. Config generated from the local server should not be committed; your local environment may not have the latest translations. Useful if you have a branch in the Kickstarter app and you want the keys to be pulled in to Android while waiting for the code to be deployed to production."
+      c.action do |args, options|
+        Milkrun::ServerConfigRefresher.new(local: (options.local || false)).refresh
+        Milkrun::I18nStringResources.new.create
+      end
+    end
+
+    run!
+  end
+end
+
+MilkrunApplication.new.run if $0 == __FILE__
